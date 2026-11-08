@@ -1,0 +1,98 @@
+name: Build Kernel (maple_dsds + ReSukiSU)
+
+# 给 Sony Xperia XZ Premium (G8142 / maple_dsds) 编一颗带「最新版 ReSukiSU」的 LineageOS 22.1 内核，
+# 产物直接用 TWRP 刷进 boot 分区（AnyKernel3，会保留你现有的 ramdisk / TWRP）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: 'ReSukiSU 内核源码版本（分支 / tag / commit）'
+        required: false
+        default: 'main'
+      defconfig:
+        description: 'defconfig 名称'
+        required: false
+        default: 'lineage-msm8998-yoshino-maple_dsds_defconfig'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+
+    steps:
+      - name: 拉取内核源码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev rsync zip unzip python3 cpio
+
+      - name: 下载 LineageOS 官方工具链
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/tc"
+          git clone --depth 1 -q https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b "$GITHUB_WORKSPACE/tc/clang"
+          git clone --depth 1 -q https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 "$GITHUB_WORKSPACE/tc/gcc64"
+          git clone --depth 1 -q https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 "$GITHUB_WORKSPACE/tc/gcc32" || echo "警告：gcc32 拉取失败，仅影响 32 位兼容层"
+          "$GITHUB_WORKSPACE/tc/clang/bin/clang" --version | head -1
+
+      - name: 集成 ReSukiSU 内核补丁
+        run: |
+          set -e
+          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "${{ inputs.ksu_ref }}"
+          echo "--- drivers/kernelsu ---"
+          ls -l drivers/kernelsu
+          echo "--- KSU 版本标识（用于确认刷完是否 >= 35061）---"
+          grep -rn "KSU_VERSION" KernelSU/kernel/ 2>/dev/null | head -5 || true
+          grep -rn "define KSU_VERSION" KernelSU/ 2>/dev/null | head -5 || true
+
+      - name: 配置内核（开启 CONFIG_KSU）
+        run: |
+          set -e
+          export PATH="$GITHUB_WORKSPACE/tc/clang/bin:$GITHUB_WORKSPACE/tc/gcc64/bin:$GITHUB_WORKSPACE/tc/gcc32/bin:$PATH"
+          make O=out ARCH=arm64 "${{ inputs.defconfig }}"
+          # 打开 KSU 与 KPROBES（ReSukiSU 非 GKI 走 kprobe 钩子）
+          ./scripts/config --file out/.config -e KSU -e KPROBES -e KALLSYMS -e KALLSYMS_ALL
+          make O=out ARCH=arm64 olddefconfig
+          echo "--- 确认关键配置 ---"
+          grep -E "^CONFIG_(KSU|KPROBES|KALLSYMS|MODULES|OVERLAY_FS)=" out/.config || true
+
+      - name: 编译 Image
+        run: |
+          set -e
+          export PATH="$GITHUB_WORKSPACE/tc/clang/bin:$GITHUB_WORKSPACE/tc/gcc64/bin:$GITHUB_WORKSPACE/tc/gcc32/bin:$PATH"
+          make -j"$(nproc)" O=out ARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE="$GITHUB_WORKSPACE/tc/gcc64/bin/aarch64-linux-android-" \
+            CROSS_COMPILE_ARM32="$GITHUB_WORKSPACE/tc/gcc32/bin/arm-linux-androideabi-" \
+            LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+            KCFLAGS="-Wno-error -Wno-deprecated-declarations" \
+            HOSTCFLAGS="-Wno-error -Wno-deprecated-declarations" \
+            Image
+          ls -lh out/arch/arm64/boot/Image
+          strings out/arch/arm64/boot/Image | grep -m1 "Linux version" || true
+          strings out/arch/arm64/boot/Image | grep -m3 -i "ReSukiSU\|KernelSU" || true
+
+      - name: 打包 AnyKernel3 刷机包
+        run: |
+          set -e
+          cp out/arch/arm64/boot/Image anykernel3/Image
+          cd anykernel3
+          zip -r9 "../ReSukiSU-kernel-maple_dsds.zip" . -x "*.git*" > /dev/null
+          cd ..
+          ls -lh ReSukiSU-kernel-maple_dsds.zip
+          unzip -l ReSukiSU-kernel-maple_dsds.zip | head -20
+
+      - name: 上传产物（刷机包 + 裸 Image）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReSukiSU-kernel-maple_dsds
+          path: |
+            ReSukiSU-kernel-maple_dsds.zip
+            out/arch/arm64/boot/Image
+          if-no-files-found: error
