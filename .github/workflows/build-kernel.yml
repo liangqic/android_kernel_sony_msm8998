@@ -50,16 +50,38 @@ jobs:
           grep -rn "KSU_VERSION" KernelSU/kernel/ 2>/dev/null | head -5 || true
           grep -rn "define KSU_VERSION" KernelSU/ 2>/dev/null | head -5 || true
 
+      # Linux 4.4 属于 Non-GKI，BakaSU 的 tracepoint hook 只支持 GKI 2.0，
+      # 所以必须改用 manual hook：往内核源码里插 4 处 ksu_handle_* 调用。
+      - name: 打 manual hook 补丁（Non-GKI 必须）
+        run: |
+          set -e
+          python3 .github/scripts/patch_manual_hook.py "$GITHUB_WORKSPACE"
+          echo "--- 校验 4 个 hook 已就位 ---"
+          grep -c "ksu_handle_stat\|ksu_handle_newfstat_ret\|ksu_handle_fstat64_ret" fs/stat.c
+          grep -c "ksu_handle_execveat\|ksu_handle_post_execveat" fs/exec.c
+          grep -c "ksu_handle_faccessat" fs/open.c
+          grep -c "ksu_handle_sys_reboot" kernel/reboot.c
+
       - name: 配置内核（开启 CONFIG_KSU）
         run: |
           set -e
           export PATH="$GITHUB_WORKSPACE/tc/clang/bin:$GITHUB_WORKSPACE/tc/gcc64/bin:$GITHUB_WORKSPACE/tc/gcc32/bin:$PATH"
           make O=out ARCH=arm64 "${{ inputs.defconfig }}"
-          # 打开 KSU 与 KPROBES（ReSukiSU 非 GKI 走 kprobe 钩子）
-          ./scripts/config --file out/.config -e KSU -e KPROBES -e KALLSYMS -e KALLSYMS_ALL
+          # Linux 4.4 是 Non-GKI：关闭 tracepoint hook，改用 manual hook，
+          # setuid / init.rc / input 三个 hook 交给 LSM 自动挂（AUTO_*_HOOK=y）。
+          ./scripts/config --file out/.config \
+            -d KSU_TRACEPOINT_HOOK \
+            -e KSU_MANUAL_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+            -e KSU -e KPROBES -e KALLSYMS -e KALLSYMS_ALL
           make O=out ARCH=arm64 olddefconfig
           echo "--- 确认关键配置 ---"
-          grep -E "^CONFIG_(KSU|KPROBES|KALLSYMS|MODULES|OVERLAY_FS)=" out/.config || true
+          grep -E "^CONFIG_(KSU|KSU_MANUAL_HOOK|KSU_TRACEPOINT_HOOK|KPROBES|KALLSYMS|MODULES|OVERLAY_FS)=" out/.config || true
+          if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
+            echo "!!! CONFIG_KSU_MANUAL_HOOK 没生效，停止"; exit 1
+          fi
 
       - name: 编译 Image
         run: |
