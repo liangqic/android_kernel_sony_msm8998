@@ -50,6 +50,25 @@ def patch(root, relpath, old, new, tag):
     print("[manual-hook]   ok  %-16s %s" % (tag, relpath))
 
 
+def check_pp_balance(root, relpath):
+    """Catch a missing #endif before the compiler does."""
+    path = os.path.join(root, relpath)
+    opens = closes = 0
+    with open(path, "r", encoding="utf-8", errors="surrogateescape") as fh:
+        for line in fh:
+            stripped = line.strip()
+            if stripped.startswith("#if"):
+                opens += 1
+            elif stripped.startswith("#endif"):
+                closes += 1
+    if opens != closes:
+        sys.exit(
+            "[manual-hook] ERROR: unbalanced preprocessor conditionals in %s "
+            "(#if*=%d, #endif=%d)" % (relpath, opens, closes)
+        )
+    print("[manual-hook]   ok  pp-balance       %s (#if*=%d)" % (relpath, opens))
+
+
 # ---------------------------------------------------------------- stat.c chunks
 STAT_DECL = L(
     IF,
@@ -60,6 +79,7 @@ STAT_DECL = L(
     "extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);",
     "#if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)",
     "extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);",
+    END,
     END,
     "",
     "",
@@ -287,6 +307,9 @@ def main():
 
     patch(root, "kernel/reboot.c", REBOOT_ANCHOR, REBOOT_DECL + REBOOT_ANCHOR, "reboot-decl")
     patch(root, "kernel/reboot.c", REBOOT_CALL_OLD, REBOOT_CALL_NEW, "reboot-call")
+
+    for rel in ("fs/stat.c", "fs/exec.c", "fs/open.c", "kernel/reboot.c"):
+        check_pp_balance(root, rel)
 
     print("[manual-hook] all hooks patched successfully")
 
