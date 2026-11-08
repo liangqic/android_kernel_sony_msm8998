@@ -1,7 +1,10 @@
 name: Build Kernel (maple_dsds + ReSukiSU)
 
-# 给 Sony Xperia XZ Premium (G8142 / maple_dsds) 编一颗带「最新版 ReSukiSU」的 LineageOS 22.1 内核，
-# 产物直接用 TWRP 刷进 boot 分区（AnyKernel3，会保留你现有的 ramdisk / TWRP）。
+# 给 Sony Xperia XZ Premium (G8142 / maple_dsds) 编 LineageOS 22.1 内核。
+# 一次 run 编两个变体（并行）：
+#   ksu   = 带 ReSukiSU 35257（manual hook，已关闭 preinit）
+#   noksu = 纯 Lineage 内核（对照组，用来判断问题出在工具链还是 KSU）
+# 产物都是 AnyKernel3 包，TWRP 直接刷，失败可回滚 boot 分区备份。
 
 on:
   workflow_dispatch:
@@ -19,6 +22,10 @@ jobs:
   build:
     runs-on: ubuntu-22.04
     timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [ksu, noksu]
 
     steps:
       - name: 拉取内核源码
@@ -41,18 +48,31 @@ jobs:
           "$GITHUB_WORKSPACE/tc/clang/bin/clang" --version | head -1
 
       - name: 集成 ReSukiSU 内核补丁
+        if: matrix.variant == 'ksu'
         run: |
           set -e
           curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "${{ inputs.ksu_ref }}"
-          echo "--- drivers/kernelsu ---"
           ls -l drivers/kernelsu
-          echo "--- KSU 版本标识（用于确认刷完是否 >= 35061）---"
           grep -rn "KSU_VERSION" KernelSU/kernel/ 2>/dev/null | head -5 || true
-          grep -rn "define KSU_VERSION" KernelSU/ 2>/dev/null | head -5 || true
 
-      # Linux 4.4 属于 Non-GKI，BakaSU 的 tracepoint hook 只支持 GKI 2.0，
-      # 所以必须改用 manual hook：往内核源码里插 4 处 ksu_handle_* 调用。
+      # 上一版刷进去无限重启，最可能死在 preinit：
+      # 它会把 PID 1 的 /system/bin/init 替换成内核里内嵌的 runner，
+      # 一旦 runner 在 4.4 上起不来，init 直接死 -> 内核 panic -> 5 秒后自动重启（正好是无限重启）。
+      # 关掉它不影响 root，只是模块挂载时机晚一点。
+      - name: 关闭 preinit（Linux 4.4 兼容）
+        if: matrix.variant == 'ksu'
+        run: |
+          set -e
+          F=KernelSU/kernel/preinit/preinit.c
+          grep -n "static bool ksu_preinit_enabled" "$F"
+          sed -i 's/static bool ksu_preinit_enabled = true;/static bool ksu_preinit_enabled = false;/' "$F"
+          grep -n "static bool ksu_preinit_enabled" "$F"
+          if grep -q "ksu_preinit_enabled = true" "$F"; then
+            echo "!!! preinit 没有关掉，停止"; exit 1
+          fi
+
       - name: 打 manual hook 补丁（Non-GKI 必须）
+        if: matrix.variant == 'ksu'
         run: |
           set -e
           python3 .github/scripts/patch_manual_hook.py "$GITHUB_WORKSPACE"
@@ -62,26 +82,28 @@ jobs:
           grep -c "ksu_handle_faccessat" fs/open.c
           grep -c "ksu_handle_sys_reboot" kernel/reboot.c
 
-      - name: 配置内核（开启 CONFIG_KSU）
+      - name: 配置内核
         run: |
           set -e
           export PATH="$GITHUB_WORKSPACE/tc/clang/bin:$GITHUB_WORKSPACE/tc/gcc64/bin:$GITHUB_WORKSPACE/tc/gcc32/bin:$PATH"
           make O=out ARCH=arm64 "${{ inputs.defconfig }}"
-          # Linux 4.4 是 Non-GKI：关闭 tracepoint hook，改用 manual hook，
-          # setuid / init.rc / input 三个 hook 交给 LSM 自动挂（AUTO_*_HOOK=y）。
-          ./scripts/config --file out/.config \
-            -d KSU_TRACEPOINT_HOOK \
-            -e KSU_MANUAL_HOOK \
-            -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
-            -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
-            -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
-            -e KSU -e KPROBES -e KALLSYMS -e KALLSYMS_ALL
+          if [ "${{ matrix.variant }}" = "ksu" ]; then
+            ./scripts/config --file out/.config \
+              -d KSU_TRACEPOINT_HOOK \
+              -e KSU_MANUAL_HOOK \
+              -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+              -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+              -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+              -e KSU
+          fi
+          ./scripts/config --file out/.config -e KPROBES -e KALLSYMS -e KALLSYMS_ALL
           make O=out ARCH=arm64 olddefconfig
           echo "--- 确认关键配置 ---"
           grep -E "^CONFIG_(KSU|KSU_MANUAL_HOOK|KSU_TRACEPOINT_HOOK|KPROBES|KALLSYMS|MODULES|OVERLAY_FS)=" out/.config || true
-          if ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
+          if [ "${{ matrix.variant }}" = "ksu" ] && ! grep -q "^CONFIG_KSU_MANUAL_HOOK=y" out/.config; then
             echo "!!! CONFIG_KSU_MANUAL_HOOK 没生效，停止"; exit 1
           fi
+          cp out/.config ".config-${{ matrix.variant }}"
 
       - name: 编译 Image
         run: |
@@ -104,17 +126,24 @@ jobs:
         run: |
           set -e
           cp out/arch/arm64/boot/Image anykernel3/Image
+          if [ "${{ matrix.variant }}" = "ksu" ]; then
+            ZIP=ReSukiSU-kernel-maple_dsds-35257.zip
+          else
+            ZIP=lineage-kernel-maple_dsds-plain.zip
+          fi
           cd anykernel3
-          zip -r9 "../ReSukiSU-kernel-maple_dsds.zip" . -x "*.git*" > /dev/null
+          zip -r9 "../$ZIP" . -x "*.git*" > /dev/null
           cd ..
-          ls -lh ReSukiSU-kernel-maple_dsds.zip
-          unzip -l ReSukiSU-kernel-maple_dsds.zip | head -20
+          ls -lh "$ZIP"
+          unzip -l "$ZIP" | head -12
 
-      - name: 上传产物（刷机包 + 裸 Image）
+      - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: ReSukiSU-kernel-maple_dsds
+          name: kernel-${{ matrix.variant }}
           path: |
-            ReSukiSU-kernel-maple_dsds.zip
+            ReSukiSU-kernel-maple_dsds-35257.zip
+            lineage-kernel-maple_dsds-plain.zip
             out/arch/arm64/boot/Image
-          if-no-files-found: error
+            .config-${{ matrix.variant }}
+          if-no-files-found: warn
